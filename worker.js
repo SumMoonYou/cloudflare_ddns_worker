@@ -1,12 +1,12 @@
 /**
- * Cloudflare DDNS Worker - IPv4 Only + ip-api 获取 IP 信息
- * 特性：
+ * Cloudflare DDNS Worker - IPv4 Only + IP 运营商信息
+ * 功能：
  * - 自动获取公网 IPv4
- * - 查询 IP 归属地（使用 ip-api）
- * - Cloudflare A 记录更新
+ * - 查询 IP 归属地及运营商（多种来源）
+ * - 更新 Cloudflare A 记录
  * - KV 保存上次 IP
- * - 夜间静默（0-8 点）
- * - Telegram 通知（美化模板 + 换行 + 运营商图标 + 更多地区 emoji）
+ * - 夜间静默（0-8点）
+ * - Telegram 通知（高大上模板，带 emoji）
  */
 
 export default {
@@ -31,7 +31,7 @@ async function runDDNS(env) {
         const ipv4 = await getIPv4FromSource();
         if (!ipv4) throw new Error("无法获取公网 IPv4");
 
-        // 查询 IP 归属地
+        // 查询 IP 归属地及运营商
         const ipinfo = await getIPInfo(ipv4);
 
         // 获取上次 IP
@@ -67,41 +67,61 @@ async function getIPv4FromSource() {
     }
 }
 
-// ===== 查询 IP 归属地（使用 ip-api） =====
+// ===== 查询 IP 归属地及运营商 =====
 async function getIPInfo(ip) {
     try {
-        const url = `http://ip-api.com/json/${ip}`;
-        const data = await fetch(url).then(res => res.json());
-        return {
-            country: data.country || "无法获取地区信息",
-            region: data.regionName || "",
-            city: data.city || "",
-            isp: data.isp || "无法获取运营商信息"
-        };
-    } catch {
-        return null;
-    }
-}
+        // 尝试使用 vore.top 的 API
+        const urlVore = `https://api.vore.top/api/IPdata?ip=${ip}`;
+        const responseVore = await fetch(urlVore);
+        const dataVore = await responseVore.json();
 
-// ===== 运营商图标 =====
-function getISPEmoji(isp = "") {
-    isp = isp.toLowerCase();
-    if (isp.includes("电信")) return "📘 电信";
-    if (isp.includes("联通")) return "🔴 联通";
-    if (isp.includes("移动")) return "🟡 移动";
-    if (isp.includes("铁通")) return "🟠 铁通";
-    if (isp.includes("教育")) return "🎓 教育网";
-    if (isp.includes("hong") || isp.includes("hk") || isp.includes("香港")) return "🇭🇰 香港";
-    if (isp.includes("taiwan") || isp.includes("台湾")) return "🇹🇼 台湾";
-    if (isp.includes("japan") || isp.includes("日本")) return "🇯🇵 日本";
-    if (isp.includes("korea") || isp.includes("韩国")) return "🇰🇷 韩国";
-    if (isp.includes("singapore") || isp.includes("新加坡")) return "🇸🇬 新加坡";
-    if (isp.includes("united states") || isp.includes("美国")) return "🇺🇸 美国";
-    if (isp.includes("germany") || isp.includes("德国")) return "🇩🇪 德国";
-    if (isp.includes("france") || isp.includes("法国")) return "🇫🇷 法国";
-    if (isp.includes("united kingdom") || isp.includes("英国")) return "🇬🇧 英国";
-    if (isp.includes("india") || isp.includes("印度")) return "🇮🇳 印度";
-    return "📡 其他";
+        // 如果解析成功，返回格式化的数据
+        if (dataVore && dataVore.code === 200) {
+            return {
+                ip: dataVore.ipinfo.text,
+                country: dataVore.ipdata.info1,
+                region: dataVore.ipdata.info2,
+                city: dataVore.ipdata.info3,
+                isp: dataVore.ipdata.isp,
+                cnip: dataVore.ipinfo.cnip,
+                error: null
+            };
+        }
+    } catch (error) {
+        console.error("Vore API 解析失败，使用备选接口", error);
+    }
+
+    // 如果 vore.top 解析失败，使用 ip-api.com 解析
+    try {
+        const urlIpApi = `http://ip-api.com/json/${ip}?lang=zh-CN`;
+        const responseIpApi = await fetch(urlIpApi);
+        const dataIpApi = await responseIpApi.json();
+        
+        // 如果 ip-api.com 解析成功
+        if (dataIpApi && dataIpApi.status === "success") {
+            return {
+                ip: dataIpApi.query,
+                country: dataIpApi.country,
+                region: dataIpApi.regionName,
+                city: dataIpApi.city,
+                isp: dataIpApi.isp,
+                cnip: dataIpApi.country === "中国", // 根据 IP 所在国家判断是否为中国 IP
+                error: null
+            };
+        } else {
+            throw new Error("ip-api 解析失败");
+        }
+    } catch (error) {
+        return {
+            ip: ip,
+            country: "未知",
+            region: "未知",
+            city: "未知",
+            isp: "未知",
+            cnip: false,
+            error: error.message || "无法解析 IP"
+        };
+    }
 }
 
 // ===== 更新 Cloudflare A 记录 =====
@@ -114,7 +134,6 @@ async function updateARecord(env, zoneId, domain, ipv4) {
                 "Content-Type": "application/json"
             }
         });
-
         let data = await res.json();
         const record = data.result[0];
         if (!record) return { ok: false, error: "未找到 A 记录" };
@@ -141,7 +160,7 @@ async function updateARecord(env, zoneId, domain, ipv4) {
     }
 }
 
-// ===== TG 美化通知（进一步美化和优化 emoji） =====
+// ===== Telegram 通知（带 emoji，高大上模板） =====
 async function sendTG(env, ipv4, ipinfo, type = "success") {
     if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) return;
 
@@ -149,31 +168,32 @@ async function sendTG(env, ipv4, ipinfo, type = "success") {
     let msg = "";
 
     if (type === "success") {
-        // 如果未能获取到 IP 归属地或运营商，替换为提示语
-        const ispEmoji = ipinfo && ipinfo.isp ? getISPEmoji(ipinfo.isp) : "📡";
-        const location = ipinfo && (ipinfo.country || ipinfo.region || ipinfo.city) 
-            ? `${ipinfo.country} ${ipinfo.region} ${ipinfo.city}` 
-            : "🌍 无法获取地区信息";
-        const isp = ipinfo && ipinfo.isp ? ipinfo.isp : "🚫 无法获取运营商信息";
+        const isp = ipinfo?.isp || "未知";
+        const country = ipinfo?.country || "未知";
+        const region = ipinfo?.region || "未知";
+        const city = ipinfo?.city || "未知";
 
         msg = `
-<b>🟢 <u>Cloudflare DDNS 更新成功</u></b>
-🌐 <b>域名：</b><code>${env.DOMAIN}</code>
-📡 <b>IPv4：</b><code>${ipv4}</code>
-${ispEmoji} <b>运营商：</b><code>${isp}</code>
-📍 <b>位置：</b><code>${location}</code>
-⏰ <b>更新时间：</b><code>${time}</code>
+<b>✅ Cloudflare DDNS 更新成功</b>
 
-<i>🎉 更新完成，感谢使用！</i>
+<b><code>${env.DOMAIN}</code></b>
+
+<b>📡 运营商：</b><i>${isp}</i>
+<b>🔗 地址：</b><i>${ipv4}</i>
+<b>🗺️ 位置：</b><i>${country} ${region} ${city}</i>
+<b>🕒 时间：</b><i>${time}</i>
+
+🎉 更新完成，感谢使用！
 `;
     } else {
         msg = `
-<b>🔴 <u>Cloudflare DDNS 更新失败</u></b>
-🌐 <b>域名：</b><code>${env.DOMAIN}</code>
-⚠️ <b>错误：</b><code>${ipv4}</code>
-⏰ <b>时间：</b><code>${time}</code>
+<b>❌ Cloudflare DDNS 更新失败</b>
 
-<i>🛠 请检查 Worker、API Key 或 DNS 配置。</i>
+<b>🌐 域名：</b><i>${env.DOMAIN}</i>
+<b>⚠️ 信息：</b><i>${ipv4}</i>
+<b>🕒 时间：</b><i>${time}</i>
+
+🛠️ 请检查 Worker 配置、API Key 或 DNS 设置。
 `;
     }
 
@@ -188,7 +208,7 @@ ${ispEmoji} <b>运营商：</b><code>${isp}</code>
     });
 }
 
-// ===== 夜间静默 0-8 点 =====
+// ===== 夜间静默 0-8点 =====
 function isNightSilent() {
     const hour = Number(getBeijingHour());
     return hour >= 0 && hour < 8;

@@ -1,227 +1,256 @@
 /**
- * Cloudflare DDNS Worker - IPv4 Only + IP 运营商信息
- * 功能：
- * - 自动获取公网 IPv4
- * - 查询 IP 归属地及运营商（多种来源）
- * - 更新 Cloudflare A 记录
- * - KV 保存上次 IP
- * - 夜间静默（0-8点）
- * - Telegram 通知（高大上模板，带 emoji）
+ * Cloudflare DDNS Worker
+ * - IPv4 Only
+ * - 自动更新 Cloudflare A 记录
+ * - 每天 0 点发送一次日报
+ * - IP 变化历史：
+ *     • 同 IP 多次出现显示所有时间点
+ *     • 标注 ⚠️ 次数
  */
 
 export default {
-    async fetch(request, env) {
-        return new Response(await runDDNS(env), {
-            headers: { "Content-Type": "text/plain; charset=utf-8" }
-        });
-    },
-
-    async scheduled(event, env, ctx) {
-        ctx.waitUntil(runDDNS(env));
-    }
+  async fetch(req, env) {
+    return new Response(await run(env), {
+      headers: { "Content-Type": "text/plain; charset=utf-8" }
+    });
+  },
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(run(env));
+  }
 };
 
-// ===== 主执行函数 =====
-async function runDDNS(env) {
-    try {
-        const domain = env.DOMAIN;
-        const zoneId = env.ZONE_ID;
+// ================= 主流程 =================
+async function run(env) {
+  try {
+    // 每天 0 点尝试发送日报
+    await trySendDailyReport(env);
 
-        // 获取公网 IPv4
-        const ipv4 = await getIPv4FromSource();
-        if (!ipv4) throw new Error("无法获取公网 IPv4");
-
-        // 查询 IP 归属地及运营商
-        const ipinfo = await getIPInfo(ipv4);
-
-        // 获取上次 IP
-        const last = await env.KV.get("ddns_last_ip") || "";
-        if (last === ipv4) return "IP 未变化，无需更新";
-
-        // 更新 Cloudflare A 记录
-        const result = await updateARecord(env, zoneId, domain, ipv4);
-
-        if (result.ok) {
-            await env.KV.put("ddns_last_ip", ipv4);
-            if (!isNightSilent()) await sendTG(env, ipv4, ipinfo, "success");
-        } else {
-            await sendTG(env, result.error, null, "error");
-        }
-
-        return "任务完成";
-    } catch (e) {
-        await sendTG(env, e.message, null, "error");
-        return `错误：${e.stack}`;
+    // 获取 IPv4
+    const ipRes = await getIPv4();
+    if (!ipRes.ok) {
+      await sendTG(env, ipRes.error, null, "ip_error");
+      return "IP 获取失败";
     }
+
+    const ipv4 = ipRes.ip;
+    const lastIP = await env.KV.get("last_ip") || "";
+
+    // IP 未变化
+    if (ipv4 === lastIP) return "IP 未变化";
+
+    // 更新 DNS
+    const update = await updateDNS(env, ipv4);
+    if (!update.ok) {
+      await sendTG(env, update.error, null, "error");
+      return "DNS 更新失败";
+    }
+
+    // 记录 IP 历史
+    await env.KV.put("last_ip", ipv4);
+    await recordDaily(env, ipv4);
+
+    return "更新完成";
+  } catch (e) {
+    await sendTG(env, e.message, null, "error");
+    return "异常";
+  }
 }
 
-// ===== 获取公网 IPv4 =====
-async function getIPv4FromSource() {
-    try {
-        const url = "https://ip.164746.xyz/ipTop.html";
-        const html = await fetch(url).then(r => r.text());
-        const match = html.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
-        return match ? match[0] : null;
-    } catch {
-        return null;
-    }
+// ================= IPv4 获取 =================
+async function getIPv4() {
+  try {
+    const res = await fetch("https://ip.164746.xyz/ipTop.html");
+    const html = await res.text();
+    const match = html.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+    if (!match) return { ok: false, error: "未解析到 IPv4" };
+    return { ok: true, ip: match[0] };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
-// ===== 查询 IP 归属地及运营商 =====
-async function getIPInfo(ip) {
-    try {
-        // 尝试使用 vore.top 的 API
-        const urlVore = `https://api.vore.top/api/IPdata?ip=${ip}`;
-        const responseVore = await fetch(urlVore);
-        const dataVore = await responseVore.json();
+// ================= DNS 更新 =================
+async function updateDNS(env, ip) {
+  try {
+    const list = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${env.ZONE_ID}/dns_records?type=A&name=${env.DOMAIN}`,
+      { headers: { Authorization: `Bearer ${env.CF_API}` } }
+    ).then(r => r.json());
 
-        // 如果解析成功，返回格式化的数据
-        if (dataVore && dataVore.code === 200) {
-            return {
-                ip: dataVore.ipinfo.text,
-                country: dataVore.ipdata.info1,
-                region: dataVore.ipdata.info2,
-                city: dataVore.ipdata.info3,
-                isp: dataVore.ipdata.isp,
-                cnip: dataVore.ipinfo.cnip,
-                error: null
-            };
-        }
-    } catch (error) {
-        console.error("Vore API 解析失败，使用备选接口", error);
-    }
+    const record = list.result?.[0];
+    if (!record) return { ok: false, error: "未找到 A 记录" };
 
-    // 如果 vore.top 解析失败，使用 ip-api.com 解析
-    try {
-        const urlIpApi = `http://ip-api.com/json/${ip}?lang=zh-CN`;
-        const responseIpApi = await fetch(urlIpApi);
-        const dataIpApi = await responseIpApi.json();
-        
-        // 如果 ip-api.com 解析成功
-        if (dataIpApi && dataIpApi.status === "success") {
-            return {
-                ip: dataIpApi.query,
-                country: dataIpApi.country,
-                region: dataIpApi.regionName,
-                city: dataIpApi.city,
-                isp: dataIpApi.isp,
-                cnip: dataIpApi.country === "中国", // 根据 IP 所在国家判断是否为中国 IP
-                error: null
-            };
-        } else {
-            throw new Error("ip-api 解析失败");
-        }
-    } catch (error) {
-        return {
-            ip: ip,
-            country: "未知",
-            region: "未知",
-            city: "未知",
-            isp: "未知",
-            cnip: false,
-            error: error.message || "无法解析 IP"
-        };
-    }
-}
-
-// ===== 更新 Cloudflare A 记录 =====
-async function updateARecord(env, zoneId, domain, ipv4) {
-    try {
-        const listURL = `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?type=A&name=${domain}`;
-        let res = await fetch(listURL, {
-            headers: {
-                "Authorization": `Bearer ${env.CF_API}`,
-                "Content-Type": "application/json"
-            }
-        });
-        let data = await res.json();
-        const record = data.result[0];
-        if (!record) return { ok: false, error: "未找到 A 记录" };
-
-        const updateURL = `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records/${record.id}`;
-        res = await fetch(updateURL, {
-            method: "PUT",
-            headers: {
-                "Authorization": `Bearer ${env.CF_API}`,
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                type: "A",
-                name: domain,
-                content: ipv4,
-                ttl: 120
-            })
-        });
-
-        data = await res.json();
-        return data.success ? { ok: true } : { ok: false, error: JSON.stringify(data.errors) };
-    } catch (e) {
-        return { ok: false, error: e.message };
-    }
-}
-
-// ===== Telegram 通知（带 emoji，高大上模板） =====
-async function sendTG(env, ipv4, ipinfo, type = "success") {
-    if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) return;
-
-    const time = getBeijingTime();
-    let msg = "";
-
-    if (type === "success") {
-        const isp = ipinfo?.isp || "未知";
-        const country = ipinfo?.country || "未知";
-        const region = ipinfo?.region || "未知";
-        const city = ipinfo?.city || "未知";
-
-        msg = `
-<b>✅ Cloudflare DDNS 更新成功</b>
-
-<b><code>${env.DOMAIN}</code></b>
-
-<b>📡 运营商：</b><i>${isp}</i>
-<b>🔗 地址：</b><i>${ipv4}</i>
-<b>🗺️ 位置：</b><i>${country} ${region} ${city}</i>
-<b>🕒 时间：</b><i>${time}</i>
-
-🎉 更新完成，感谢使用！
-`;
-    } else {
-        msg = `
-<b>❌ Cloudflare DDNS 更新失败</b>
-
-<b>🌐 域名：</b><i>${env.DOMAIN}</i>
-<b>⚠️ 信息：</b><i>${ipv4}</i>
-<b>🕒 时间：</b><i>${time}</i>
-
-🛠️ 请检查 Worker 配置、API Key 或 DNS 设置。
-`;
-    }
-
-    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${env.ZONE_ID}/dns_records/${record.id}`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${env.CF_API}`,
+          "Content-Type": "application/json"
+        },
         body: JSON.stringify({
-            chat_id: env.TG_CHAT_ID,
-            text: msg,
-            parse_mode: "HTML"
+          type: "A",
+          name: env.DOMAIN,
+          content: ip,
+          ttl: 120
         })
-    });
+      }
+    ).then(r => r.json());
+
+    return res.success
+      ? { ok: true }
+      : { ok: false, error: JSON.stringify(res.errors) };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
-// ===== 夜间静默 0-8点 =====
-function isNightSilent() {
-    const hour = Number(getBeijingHour());
-    return hour >= 0 && hour < 8;
+// ================= IP 信息 =================
+async function getIPInfo(ip) {
+  try {
+    const r = await fetch(`https://api.vore.top/api/IPdata?ip=${ip}`);
+    const d = await r.json();
+    if (d.code === 200) {
+      return {
+        isp: d.ipdata.isp,
+        region: `${d.ipdata.info1} ${d.ipdata.info2} ${d.ipdata.info3}`
+      };
+    }
+  } catch {}
+  return {};
 }
 
-// ===== 工具：北京时间 =====
-function getBeijingTime() {
-    return new Date(Date.now() + 8 * 3600 * 1000)
-        .toISOString()
-        .replace("T", " ")
-        .split(".")[0];
+// ================= 日报记录 =================
+async function recordDaily(env, ip) {
+  const today = getBJDate();
+  const dateKey = "daily_date";
+
+  // 新的一天重置
+  if ((await env.KV.get(dateKey)) !== today) {
+    await env.KV.put(dateKey, today);
+    await env.KV.put("daily_history", "[]");
+  }
+
+  const history = JSON.parse(await env.KV.get("daily_history") || "[]");
+  history.push({ ip, time: getBJTime() });
+  await env.KV.put("daily_history", JSON.stringify(history));
 }
 
-function getBeijingHour() {
-    return new Date(Date.now() + 8 * 3600 * 1000).getUTCHours();
+// ================= 日报发送 =================
+async function trySendDailyReport(env) {
+  if (getBJHour() !== 0) return;
+
+  const today = getBJDate();
+  if ((await env.KV.get("daily_sent")) === today) return;
+
+  const history = JSON.parse(await env.KV.get("daily_history") || "[]");
+  const lastIP = await env.KV.get("last_ip") || "未知";
+  const ipinfo = lastIP !== "未知" ? await getIPInfo(lastIP) : {};
+
+  await sendTG(env, lastIP, ipinfo, "daily", { history });
+  await env.KV.put("daily_sent", today);
 }
+
+// ================= Telegram =================
+async function sendTG(env, info, ipinfo, type, data = {}) {
+  if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) return;
+
+  const time = getBJTime();
+  const historyText = formatHistory(data.history || []);
+
+  let msg = `
+<b>📅 Cloudflare DDNS 每日提醒</b>
+
+<b>🌐 域名：</b><b>${env.DOMAIN}</b>
+
+<b>📜 IP 变化历史：</b>
+${historyText}
+
+<b>📍 当前 IP：</b><code>${info}</code>
+<b>📡 运营商：</b><i>${ipinfo?.isp || "未知"}</i>
+<b>🕒 时间：</b><i>${time}</i>
+
+✅ 今日 DDNS 状态正常
+`;
+
+  if (type === "ip_error") {
+    msg = `
+<b>🚨 DDNS IP 获取失败</b>
+
+<b>${env.DOMAIN}</b>
+错误信息：<i>${info}</i>
+<b>时间：</b><i>${time}</i>
+`;
+  }
+
+  if (type === "error") {
+    msg = `
+<b>❌ Cloudflare DDNS 错误</b>
+
+<b>${env.DOMAIN}</b>
+错误信息：<i>${info}</i>
+<b>时间：</b><i>${time}</i>
+`;
+  }
+
+  await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: env.TG_CHAT_ID,
+      text: msg,
+      parse_mode: "HTML"
+    })
+  });
+}
+
+// ================= IP 历史格式化（多次显示时间点 + ⚠️ 次数） =================
+function formatHistory(list = []) {
+  if (!list.length) return "<i>无 IP 变化</i>";
+
+  const map = new Map();
+
+  // 合并同 IP，收集所有时间点
+  for (const { ip, time } of list) {
+    if (!map.has(ip)) {
+      map.set(ip, { ip, times: [time], count: 1 });
+    } else {
+      const v = map.get(ip);
+      v.times.push(time);
+      v.count++;
+    }
+  }
+
+  const merged = Array.from(map.values());
+  const totalIPs = merged.length;
+  const nums = [
+    // 1-10
+    "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩",
+    // 11-20
+    "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰", "⑱", "⑲", "⑳",
+    // 21-30
+    "㉑", "㉒", "㉓", "㉔", "㉕", "㉖", "㉗", "㉘", "㉙", "㉚",
+    // 31-40
+    "㉛", "㉜", "㉝", "㉞", "㉟", "㊱", "㊲", "㊳", "㊴", "㊵",
+    // 41-50
+    "㊶", "㊷", "㊸", "㊹", "㊺", "㊻", "㊼", "㊽", "㊾", "㊿"
+  ];
+
+  const body = merged.map((v, i) => {
+    // 显示 HH:mm
+    const timePoints = v.times.map(t => t.slice(11,16)).join(" / ");
+    const countMark = v.count > 1 ? `   ⚠️ ${v.count} 次` : "";
+
+    return `${nums[i] || `${i + 1}.`} <code>${v.ip}</code>
+   🕒 <i>${timePoints}</i>${countMark}`;
+  }).join("\n\n");
+
+  return `（今日共更换 ${totalIPs} 个 IP）\n\n${body}`;
+}
+
+// ================= 北京时间工具 =================
+const BJ = 8 * 3600 * 1000;
+const nowBJ = () => new Date(Date.now() + BJ);
+const getBJTime = () => nowBJ().toISOString().replace("T", " ").split(".")[0];
+const getBJDate = () => nowBJ().toISOString().slice(0, 10);
+const getBJHour = () => nowBJ().getUTCHours();

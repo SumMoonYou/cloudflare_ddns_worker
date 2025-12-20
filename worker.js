@@ -1,58 +1,109 @@
 /**
- * Cloudflare DDNS Worker
- * - IPv4 Only
  * - 自动更新 Cloudflare A 记录
  * - 每天 0 点发送一次日报
- * - IP 变化历史：
- *     • 同 IP 多次出现显示所有时间点
- *     • 标注 ⚠️ 次数
+ * - 支持 /update 手动触发
+ * - 支持 /notify 立即发送 TG 测试
  */
-
 export default {
   async fetch(req, env) {
-    return new Response(await run(env), {
+    const url = new URL(req.url);
+
+    // 手动更新（不发 TG）
+    if (url.pathname === "/update") {
+      const result = await run(env, { manual: true });
+      return new Response(result, {
+        headers: { "Content-Type": "text/plain; charset=utf-8" }
+      });
+    }
+
+    // 手动触发 + 立即发送 TG（测试排版/效果）
+    if (url.pathname === "/notify") {
+      const result = await run(env, { manual: true, notify: true });
+      return new Response(result, {
+        headers: { "Content-Type": "text/plain; charset=utf-8" }
+      });
+    }
+
+    return new Response("Cloudflare DDNS Worker 正常运行", {
       headers: { "Content-Type": "text/plain; charset=utf-8" }
     });
   },
+
   async scheduled(event, env, ctx) {
     ctx.waitUntil(run(env));
   }
 };
 
 // ================= 主流程 =================
-async function run(env) {
-  try {
-    // 每天 0 点尝试发送日报
-    await trySendDailyReport(env);
+async function run(env, opts = {}) {
+  const manual = opts.manual === true;
+  const notify = opts.notify === true;
+  const time = getBJTime();
 
-    // 获取 IPv4
+  try {
+    if (!manual) {
+      await trySendDailyReport(env);
+    }
+
     const ipRes = await getIPv4();
     if (!ipRes.ok) {
-      await sendTG(env, ipRes.error, null, "ip_error");
-      return "IP 获取失败";
+      if (!manual && !notify) await sendTG(env, ipRes.error, null, "ip_error");
+      if (notify) {
+        await sendTG(env, ipRes.error, {}, "daily", {
+          history: JSON.parse(await env.KV.get("daily_history") || "[]")
+        });
+      }
+      return manual || notify ? `失败：${ipRes.error}` : "IP 获取失败";
     }
 
     const ipv4 = ipRes.ip;
     const lastIP = await env.KV.get("last_ip") || "";
 
     // IP 未变化
-    if (ipv4 === lastIP) return "IP 未变化";
+    if (ipv4 === lastIP) {
+      if (notify) {
+        await sendTG(env, ipv4, {}, "daily", {
+          history: JSON.parse(await env.KV.get("daily_history") || "[]")
+        });
+      }
+      return manual || notify
+        ? `DDNS 通知测试\nIP 未变化\n${ipv4}\n${time}`
+        : "IP 未变化";
+    }
 
     // 更新 DNS
     const update = await updateDNS(env, ipv4);
     if (!update.ok) {
-      await sendTG(env, update.error, null, "error");
-      return "DNS 更新失败";
+      if (!manual && !notify) await sendTG(env, update.error, null, "error");
+      if (notify) {
+        await sendTG(env, update.error, {}, "daily", {
+          history: JSON.parse(await env.KV.get("daily_history") || "[]")
+        });
+      }
+      return manual || notify ? `DNS 更新失败\n${update.error}` : "DNS 更新失败";
     }
 
     // 记录 IP 历史
     await env.KV.put("last_ip", ipv4);
     await recordDaily(env, ipv4);
 
-    return "更新完成";
+    if (notify) {
+      const history = JSON.parse(await env.KV.get("daily_history") || "[]");
+      await sendTG(env, ipv4, {}, "daily", { history });
+    }
+
+    return manual
+      ? `DDNS 通知测试完成\n${env.DOMAIN}\n${ipv4}\n${time}`
+      : "更新完成";
+
   } catch (e) {
-    await sendTG(env, e.message, null, "error");
-    return "异常";
+    if (!manual && !notify) await sendTG(env, e.message, null, "error");
+    if (notify) {
+      await sendTG(env, e.message, {}, "daily", {
+        history: JSON.parse(await env.KV.get("daily_history") || "[]")
+      });
+    }
+    return manual || notify ? `异常\n${e.message}` : "异常";
   }
 }
 
@@ -60,10 +111,25 @@ async function run(env) {
 async function getIPv4() {
   try {
     const res = await fetch("https://ip.164746.xyz/ipTop.html");
+    if (!res.ok) return { ok: false, error: "请求失败" };
+
     const html = await res.text();
-    const match = html.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
-    if (!match) return { ok: false, error: "未解析到 IPv4" };
-    return { ok: true, ip: match[0] };
+    const ips = html.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g);
+    if (!ips) return { ok: false, error: "未解析到 IPv4" };
+
+    var valid = [];
+    for (var i = 0; i < ips.length; i++) {
+      var p = ips[i].split(".");
+      if (p.length !== 4) continue;
+      if (
+        p[0] <= 255 && p[1] <= 255 &&
+        p[2] <= 255 && p[3] <= 255
+      ) valid.push(ips[i]);
+    }
+
+    if (!valid.length) return { ok: false, error: "无合法 IPv4" };
+    return { ok: true, ip: valid[Math.floor(Math.random() * valid.length)] };
+
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -77,7 +143,7 @@ async function updateDNS(env, ip) {
       { headers: { Authorization: `Bearer ${env.CF_API}` } }
     ).then(r => r.json());
 
-    const record = list.result?.[0];
+    const record = list.result && list.result[0];
     if (!record) return { ok: false, error: "未找到 A 记录" };
 
     const res = await fetch(
@@ -105,29 +171,11 @@ async function updateDNS(env, ip) {
   }
 }
 
-// ================= IP 信息 =================
-async function getIPInfo(ip) {
-  try {
-    const r = await fetch(`https://api.vore.top/api/IPdata?ip=${ip}`);
-    const d = await r.json();
-    if (d.code === 200) {
-      return {
-        isp: d.ipdata.isp,
-        region: `${d.ipdata.info1} ${d.ipdata.info2} ${d.ipdata.info3}`
-      };
-    }
-  } catch {}
-  return {};
-}
-
 // ================= 日报记录 =================
 async function recordDaily(env, ip) {
   const today = getBJDate();
-  const dateKey = "daily_date";
-
-  // 新的一天重置
-  if ((await env.KV.get(dateKey)) !== today) {
-    await env.KV.put(dateKey, today);
+  if ((await env.KV.get("daily_date")) !== today) {
+    await env.KV.put("daily_date", today);
     await env.KV.put("daily_history", "[]");
   }
 
@@ -145,9 +193,8 @@ async function trySendDailyReport(env) {
 
   const history = JSON.parse(await env.KV.get("daily_history") || "[]");
   const lastIP = await env.KV.get("last_ip") || "未知";
-  const ipinfo = lastIP !== "未知" ? await getIPInfo(lastIP) : {};
 
-  await sendTG(env, lastIP, ipinfo, "daily", { history });
+  await sendTG(env, lastIP, {}, "daily", { history });
   await env.KV.put("daily_sent", today);
 }
 
@@ -156,41 +203,29 @@ async function sendTG(env, info, ipinfo, type, data = {}) {
   if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) return;
 
   const time = getBJTime();
-  const historyText = formatHistory(data.history || []);
+  const history = formatHistory(data.history || []);
 
   let msg = `
 <b>📅 Cloudflare DDNS 每日提醒</b>
 
-<b>🌐 域名：</b><b>${env.DOMAIN}</b>
+🌐 <b>域名：</b><code>${env.DOMAIN}</code>
 
-<b>📜 IP 变化历史：</b>
-${historyText}
+${history.summary}
 
-<b>📍 当前 IP：</b><code>${info}</code>
-<b>📡 运营商：</b><i>${ipinfo?.isp || "未知"}</i>
-<b>🕒 时间：</b><i>${time}</i>
+${history.body}
 
-✅ 今日 DDNS 状态正常
+📍 <b>当前 IP：</b><code>${info}</code>
+🕒 <b>时间：</b><i>${time}</i>
+
+✅ <b>今日 DDNS 状态正常</b>
 `;
 
   if (type === "ip_error") {
-    msg = `
-<b>🚨 DDNS IP 获取失败</b>
-
-<b>${env.DOMAIN}</b>
-错误信息：<i>${info}</i>
-<b>时间：</b><i>${time}</i>
-`;
+    msg = `<b>🚨 DDNS IP 获取失败</b>\n${env.DOMAIN}\n${info}\n${time}`;
   }
 
   if (type === "error") {
-    msg = `
-<b>❌ Cloudflare DDNS 错误</b>
-
-<b>${env.DOMAIN}</b>
-错误信息：<i>${info}</i>
-<b>时间：</b><i>${time}</i>
-`;
+    msg = `<b>❌ DDNS 错误</b>\n${env.DOMAIN}\n${info}\n${time}`;
   }
 
   await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
@@ -204,51 +239,56 @@ ${historyText}
   });
 }
 
-// ================= IP 历史格式化（多次显示时间点 + ⚠️ 次数） =================
-function formatHistory(list = []) {
-  if (!list.length) return "<i>无 IP 变化</i>";
+// ================= 历史格式化（无折叠） =================
+function formatHistory(list) {
+  if (!list.length) {
+    return {
+      summary: "📊 <b>今日概览</b>\n• IP 变更次数：0",
+      body: "<i>无 IP 变化</i>"
+    };
+  }
 
   const map = new Map();
-
-  // 合并同 IP，收集所有时间点
-  for (const { ip, time } of list) {
-    if (!map.has(ip)) {
-      map.set(ip, { ip, times: [time], count: 1 });
-    } else {
-      const v = map.get(ip);
-      v.times.push(time);
-      v.count++;
+  for (const v of list) {
+    if (!map.has(v.ip)) map.set(v.ip, { ip: v.ip, times: [v.time], count: 1 });
+    else {
+      const m = map.get(v.ip);
+      m.times.push(v.time);
+      m.count++;
     }
   }
 
   const merged = Array.from(map.values());
-  const totalIPs = merged.length;
-  const nums = [
-    // 1-10
-    "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩",
-    // 11-20
-    "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰", "⑱", "⑲", "⑳",
-    // 21-30
-    "㉑", "㉒", "㉓", "㉔", "㉕", "㉖", "㉗", "㉘", "㉙", "㉚",
-    // 31-40
-    "㉛", "㉜", "㉝", "㉞", "㉟", "㊱", "㊲", "㊳", "㊴", "㊵",
-    // 41-50
-    "㊶", "㊷", "㊸", "㊹", "㊺", "㊻", "㊼", "㊽", "㊾", "㊿"
-  ];
 
-  const body = merged.map((v, i) => {
-    // 显示 HH:mm
-    const timePoints = v.times.map(t => t.slice(11,16)).join(" / ");
-    const countMark = v.count > 1 ? `   ⚠️ ${v.count} 次` : "";
+  let max = merged[0];
+  for (const v of merged) if (v.count > max.count) max = v;
 
-    return `${nums[i] || `${i + 1}.`} <code>${v.ip}</code>
-   🕒 <i>${timePoints}</i>${countMark}`;
-  }).join("\n\n");
+  const display = merged; // 全部显示，无折叠
 
-  return `（今日共更换 ${totalIPs} 个 IP）\n\n${body}`;
+  const body = display.map((v, i) => {
+    const times = v.times.map(t => t.slice(11, 16)).join(" / ");
+    let warn = "";
+    if (v.count >= 3) warn = ` 🔥 <b>${v.count} 次</b>`;
+    else if (v.count >= 2) warn = ` ⚠️ <b>${v.count} 次</b>`;
+    return `${i + 1}. <code>${v.ip}</code>   🕒 ${times}${warn}`;
+  }).join("\n");
+
+  return {
+    summary:
+`📊 <b>今日概览</b>
+• IP 变更次数：<b>${merged.length}</b>
+• 最频繁IP：<code>${max.ip}</code>（${max.count} 次）
+• 最大更换：${max.count >= 3 ? "🔥" : "⚠️"} <b>${max.count} 次</b>`,
+
+    body:
+`📜 <b>IP 变化历史</b>
+────────────────
+${body}
+────────────────`
+  };
 }
 
-// ================= 北京时间工具 =================
+// ================= 北京时间 =================
 const BJ = 8 * 3600 * 1000;
 const nowBJ = () => new Date(Date.now() + BJ);
 const getBJTime = () => nowBJ().toISOString().replace("T", " ").split(".")[0];

@@ -1,16 +1,4 @@
-/**
- * Cloudflare DDNS Worker
- * 功能：
- *  - IPv4 自动获取并更新 Cloudflare A 记录
- *  - 支持手动更新 (/update)
- *  - 支持立即发送 TG 通知 (/notify)
- *  - 每天 0 点自动发送每日 IP 变化报表
- *  - IP 变化历史完整记录（不折叠）
- *  - Telegram 消息美化，标注抖动次数
- */
-
 export default {
-  // HTTP 请求入口
   async fetch(req, env) {
     const url = new URL(req.url);
 
@@ -30,41 +18,29 @@ export default {
       });
     }
 
-    // 默认返回状态信息
     return new Response("Cloudflare DDNS Worker 正常运行", {
       headers: { "Content-Type": "text/plain; charset=utf-8" }
     });
   },
 
-  // 定时任务入口，每天或按 Worker Scheduler 触发
   async scheduled(event, env, ctx) {
     ctx.waitUntil(run(env));
   }
 };
 
 // ================= 主流程 =================
-/**
- * run 主函数
- * @param {Object} env Worker 环境变量（KV、CF_API、TG_BOT_TOKEN 等）
- * @param {Object} opts 选项：
- *    - manual: 是否手动触发（true 不触发定时日报）
- *    - notify: 是否立即发送 TG 通知
- */
 async function run(env, opts = {}) {
   const manual = opts.manual === true;
   const notify = opts.notify === true;
   const time = getBJTime();
 
   try {
-    // 如果不是手动触发，则尝试发送每日报表
     if (!manual) {
       await trySendDailyReport(env);
     }
 
-    // 获取 IPv4
     const ipRes = await getIPv4();
     if (!ipRes.ok) {
-      // IP 获取失败处理
       if (!manual && !notify) await sendTG(env, ipRes.error, null, "ip_error");
       if (notify) {
         await sendTG(env, ipRes.error, {}, "daily", {
@@ -77,10 +53,8 @@ async function run(env, opts = {}) {
     const ipv4 = ipRes.ip;
     const lastIP = await env.KV.get("last_ip") || "";
 
-    // IP 未变化
     if (ipv4 === lastIP) {
       if (notify) {
-        // 手动/notify 模式仍然发送 TG（用于测试排版）
         await sendTG(env, ipv4, {}, "daily", {
           history: JSON.parse(await env.KV.get("daily_history") || "[]")
         });
@@ -90,10 +64,8 @@ async function run(env, opts = {}) {
         : "IP 未变化";
     }
 
-    // IP 变化，更新 Cloudflare A 记录
     const update = await updateDNS(env, ipv4);
     if (!update.ok) {
-      // 更新失败处理
       if (!manual && !notify) await sendTG(env, update.error, null, "error");
       if (notify) {
         await sendTG(env, update.error, {}, "daily", {
@@ -103,11 +75,9 @@ async function run(env, opts = {}) {
       return manual || notify ? `DNS 更新失败\n${update.error}` : "DNS 更新失败";
     }
 
-    // 记录 IP 历史
     await env.KV.put("last_ip", ipv4);
     await recordDaily(env, ipv4);
 
-    // notify 模式下发送 TG
     if (notify) {
       const history = JSON.parse(await env.KV.get("daily_history") || "[]");
       await sendTG(env, ipv4, {}, "daily", { history });
@@ -118,7 +88,6 @@ async function run(env, opts = {}) {
       : "更新完成";
 
   } catch (e) {
-    // 捕获异常并发送 TG
     if (!manual && !notify) await sendTG(env, e.message, null, "error");
     if (notify) {
       await sendTG(env, e.message, {}, "daily", {
@@ -130,10 +99,6 @@ async function run(env, opts = {}) {
 }
 
 // ================= IPv4 获取 =================
-/**
- * getIPv4
- * 从第三方页面获取公网 IPv4，随机选择一个合法 IP
- */
 async function getIPv4() {
   try {
     const res = await fetch("https://ip.164746.xyz/ipTop.html");
@@ -160,12 +125,6 @@ async function getIPv4() {
 }
 
 // ================= DNS 更新 =================
-/**
- * updateDNS
- * @param {Object} env Worker 环境
- * @param {string} ip 新 IP
- * @returns {Object} 更新结果
- */
 async function updateDNS(env, ip) {
   try {
     const list = await fetch(
@@ -202,12 +161,6 @@ async function updateDNS(env, ip) {
 }
 
 // ================= 日报记录 =================
-/**
- * recordDaily
- * @param {Object} env Worker KV
- * @param {string} ip 当前 IP
- * 保存每日 IP 历史
- */
 async function recordDaily(env, ip) {
   const today = getBJDate();
   if ((await env.KV.get("daily_date")) !== today) {
@@ -221,10 +174,6 @@ async function recordDaily(env, ip) {
 }
 
 // ================= 日报发送 =================
-/**
- * trySendDailyReport
- * 每天 0 点发送日报
- */
 async function trySendDailyReport(env) {
   if (getBJHour() !== 0) return;
 
@@ -239,14 +188,6 @@ async function trySendDailyReport(env) {
 }
 
 // ================= Telegram =================
-/**
- * sendTG
- * @param {Object} env Worker 环境
- * @param {string} info 当前 IP 或错误信息
- * @param {Object} ipinfo 可选 IP 运营商信息
- * @param {string} type 类型：daily / error / ip_error
- * @param {Object} data 附加数据 { history }
- */
 async function sendTG(env, info, ipinfo, type, data = {}) {
   if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) return;
 
@@ -287,7 +228,7 @@ ${history.body}
   });
 }
 
-// ================= 历史格式化（无折叠） =================
+// ================= 历史格式化（无折叠、最频繁 IP 次数 >1） =================
 function formatHistory(list) {
   if (!list.length) {
     return {
@@ -308,12 +249,16 @@ function formatHistory(list) {
 
   const merged = Array.from(map.values());
 
-  let max = merged[0];
-  for (const v of merged) if (v.count > max.count) max = v;
+  // 只统计出现次数 > 1 的最频繁 IP
+  const frequentIPs = merged.filter(v => v.count > 1);
+  let frequentSummary = "";
+  if (frequentIPs.length > 0) {
+    let max = frequentIPs[0];
+    for (const v of frequentIPs) if (v.count > max.count) max = v;
+    frequentSummary = `• 最频繁 IP：<code>${max.ip}</code>（${max.count} 次）\n• 最大更换：${max.count >= 3 ? "🔥" : "⚠️"} <b>${max.count} 次</b>`;
+  }
 
-  const display = merged; // 全部显示，无折叠
-
-  const body = display.map((v, i) => {
+  const body = merged.map((v, i) => {
     const times = v.times.map(t => t.slice(11, 16)).join(" / ");
     let warn = "";
     if (v.count >= 3) warn = ` 🔥 <b>${v.count} 次</b>`;
@@ -325,8 +270,7 @@ function formatHistory(list) {
     summary:
 `📊 <b>今日概览</b>
 • IP 变更次数：<b>${merged.length}</b>
-• 最频繁IP：<code>${max.ip}</code>（${max.count} 次）
-• 最大更换：${max.count >= 3 ? "🔥" : "⚠️"} <b>${max.count} 次</b>`,
+${frequentSummary}`,
 
     body:
 `📜 <b>IP 变化历史</b>
@@ -337,7 +281,7 @@ ${body}
 }
 
 // ================= 北京时间 =================
-const BJ = 8 * 3600 * 1000; // 东八区偏移
+const BJ = 8 * 3600 * 1000;
 const nowBJ = () => new Date(Date.now() + BJ);
 const getBJTime = () => nowBJ().toISOString().replace("T", " ").split(".")[0];
 const getBJDate = () => nowBJ().toISOString().slice(0, 10);

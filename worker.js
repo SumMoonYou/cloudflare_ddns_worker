@@ -191,30 +191,26 @@ async function trySendDailyReport(env) {
 async function sendTG(env, info, ipinfo, type, data = {}) {
   if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) return;
 
-  const time = getBJTime();
-  const history = formatHistory(data.history || []);
+  const history = data.history || [];
 
-  let msg = `
-<b>📅 Cloudflare DDNS 每日提醒</b>
+  let msg = `📢 <b>CloudFlare 优选IP更新通知</b>
 
-🌐 <b>域名：</b><code>${env.DOMAIN}</code>
 
-${history.summary}
-
-${history.body}
-
-📍 <b>当前 IP：</b><code>${info}</code>
-🕒 <b>时间：</b><i>${time}</i>
-
-✅ <b>今日 DDNS 状态正常</b>
+🌐 域名：<code>${env.DOMAIN}</code>
+📊 状态：${history.length ? "⚡ 有变更" : "✅ 未变化"}
 `;
 
+  if (history.length) {
+    msg += `\n⬇️⬇️⬇️ 变更记录 ⬇️⬇️⬇️
+${history.map((v, i) => `第${i + 1}个：<code>${v.ip}</code>，时间：${v.time.slice(11,16)}`).join("\n")}\n`;
+  }
+
   if (type === "ip_error") {
-    msg = `<b>🚨 DDNS IP 获取失败</b>\n${env.DOMAIN}\n${info}\n${time}`;
+    msg += `⚠️ 异常：IP 获取失败\n`;
   }
 
   if (type === "error") {
-    msg = `<b>❌ DDNS 错误</b>\n${env.DOMAIN}\n${info}\n${time}`;
+    msg += `⚠️ 异常：${info}\n`;
   }
 
   await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
@@ -222,7 +218,7 @@ ${history.body}
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: env.TG_CHAT_ID,
-      text: msg,
+      text: msg.trim(),
       parse_mode: "HTML"
     })
   });

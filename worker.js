@@ -192,37 +192,59 @@ async function sendTG(env, info, ipinfo, type, data = {}) {
   if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) return;
 
   const history = data.history || [];
+  
+  // 1. 动态序号生成器
+  const getEmoji = (i) => (i + 1).toString().split('').map(d => d + '\uFE0F\u20E3').join('');
 
-  let msg = `📢 <b>CloudFlare 优选IP更新通知</b>
-
-
-🌐 域名：<code>${env.DOMAIN}</code>
-📊 状态：${history.length ? "⚡ 有变更" : "✅ 未变化"}
-`;
+  let msg = `📢 <b>CloudFlare 优选IP更新通知</b>\n\n`;
+  msg += `🌐 域名：<code>${env.DOMAIN}</code>\n`;
 
   if (history.length) {
-    msg += `\n⬇️⬇️⬇️ 变更记录 ⬇️⬇️⬇️
-${history.map((v, i) => `第${i + 1}个：<code>${v.ip}</code>，时间：${v.time.slice(11,16)}`).join("\n")}\n`;
+    msg += `⬇️⬇️⬇️ 变更记录 ⬇️⬇️⬇️\n`;
+
+    const total = history.length;
+    let displayList = [];
+
+    if (total <= 15) {
+      // 数量少于 15 个，全部显示
+      displayList = history.map((v, i) => ({ ...v, idx: i }));
+    } else {
+      // 数量多时：保留前 5 个 和 最后 5 个，中间用省略号
+      const head = history.slice(0, 5).map((v, i) => ({ ...v, idx: i }));
+      const tail = history.slice(-5).map((v, i) => ({ ...v, idx: total - 5 + i }));
+      
+      displayList = [...head, { isSeparator: true }, ...tail];
+    }
+
+    msg += displayList.map(item => {
+      if (item.isSeparator) return `<code>      ...... (中间省略 ${total - 10} 个)</code>`;
+      const ipLink = `https://ip.gs/${item.ip}`;
+      return `${getEmoji(item.idx)}<a href=" ">${item.ip}</a >，🕐${item.time.slice(11, 16)}`;
+    }).join("\n");
+
+    msg += `\n\n✅ 共计：<b>${total}</b> 个优选节点`;
+  } else if (type === "error" || type === "ip_error") {
+    msg += `\n⚠️ 异常：${info || "IP 获取失败"}`;
+  } else {
+    msg += `\n✅ 状态：未发生变更`;
   }
 
-  if (type === "ip_error") {
-    msg += `⚠️ 异常：IP 获取失败\n`;
+  try {
+    await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: env.TG_CHAT_ID,
+        text: msg,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true 
+      }),
+    });
+  } catch (e) {
+    console.error('TG 推送失败');
   }
-
-  if (type === "error") {
-    msg += `⚠️ 异常：${info}\n`;
-  }
-
-  await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: env.TG_CHAT_ID,
-      text: msg.trim(),
-      parse_mode: "HTML"
-    })
-  });
 }
+
 
 // ================= 历史格式化（无折叠、最频繁 IP 次数 >1） =================
 function formatHistory(list) {

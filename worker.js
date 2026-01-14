@@ -109,16 +109,27 @@ async function getIPv4() {
     if (!ips) return { ok: false, error: "未解析到 IPv4" };
 
     var valid = [];
-    for (var i = 0; i < ips.length; i++) {
-      var p = ips[i].split(".");
-      if (p.length !== 4) continue;
-      if (p[0] <= 255 && p[1] <= 255 && p[2] <= 255 && p[3] <= 255)
-        valid.push(ips[i]);
-    }
 
+    for (var i = 0; i < ips.length; i++) {
+      var parts = ips[i].split(".");
+      if (parts.length !== 4) continue;
+    
+      var ok = true;
+      for (var j = 0; j < 4; j++) {
+        if (!/^\d+$/.test(parts[j])) {
+          ok = false;
+          break;
+        }
+        var num = Number(parts[j]);
+        if (num < 0 || num > 255) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) valid.push(ips[i]);
+    }
     if (!valid.length) return { ok: false, error: "无合法 IPv4" };
     return { ok: true, ip: valid[Math.floor(Math.random() * valid.length)] };
-
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -205,12 +216,12 @@ async function sendTG(env, info, ipinfo, type, data = {}) {
     const total = history.length;
     let displayList = [];
 
-    if (total <= 15) {
-      // 数量少于 15 个，全部显示
+    if (total <= 24) {
+      // 数量少于 24 个，全部显示
       displayList = history.map((v, i) => ({ ...v, idx: i }));
     } else {
       // 数量多时：保留前 5 个 和 最后 5 个，中间用省略号
-      const head = history.slice(0, 5).map((v, i) => ({ ...v, idx: i }));
+      const head = history.slice(0, 12).map((v, i) => ({ ...v, idx: i }));
       const tail = history.slice(-5).map((v, i) => ({ ...v, idx: total - 5 + i }));
       
       displayList = [...head, { isSeparator: true }, ...tail];
@@ -244,60 +255,6 @@ async function sendTG(env, info, ipinfo, type, data = {}) {
     console.error('TG 推送失败');
   }
 }
-
-
-// ================= 历史格式化（无折叠、最频繁 IP 次数 >1） =================
-function formatHistory(list) {
-  if (!list.length) {
-    return {
-      summary: "📊 <b>今日概览</b>\n• IP 变更次数：0",
-      body: "<i>无 IP 变化</i>"
-    };
-  }
-
-  const map = new Map();
-  for (const v of list) {
-    if (!map.has(v.ip)) map.set(v.ip, { ip: v.ip, times: [v.time], count: 1 });
-    else {
-      const m = map.get(v.ip);
-      m.times.push(v.time);
-      m.count++;
-    }
-  }
-
-  const merged = Array.from(map.values());
-
-  // 只统计出现次数 > 1 的最频繁 IP
-  const frequentIPs = merged.filter(v => v.count > 1);
-  let frequentSummary = "";
-  if (frequentIPs.length > 0) {
-    let max = frequentIPs[0];
-    for (const v of frequentIPs) if (v.count > max.count) max = v;
-    frequentSummary = `• 最频繁 IP：<code>${max.ip}</code>（${max.count} 次）\n• 最大更换：${max.count >= 3 ? "🔥" : "⚠️"} <b>${max.count} 次</b>`;
-  }
-
-  const body = merged.map((v, i) => {
-    const times = v.times.map(t => t.slice(11, 16)).join(" / ");
-    let warn = "";
-    if (v.count >= 3) warn = ` 🔥 <b>${v.count} 次</b>`;
-    else if (v.count >= 2) warn = ` ⚠️ <b>${v.count} 次</b>`;
-    return `${i + 1}. <code>${v.ip}</code>   🕒 ${times}${warn}`;
-  }).join("\n");
-
-  return {
-    summary:
-`📊 <b>今日概览</b>
-• IP 变更次数：<b>${merged.length}</b>
-${frequentSummary}`,
-
-    body:
-`📜 <b>IP 变化历史</b>
-──────────────────────
-${body}
-──────────────────────`
-  };
-}
-
 // ================= 北京时间 =================
 const BJ = 8 * 3600 * 1000;
 const nowBJ = () => new Date(Date.now() + BJ);
